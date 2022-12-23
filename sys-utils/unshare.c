@@ -87,6 +87,50 @@ static const char *setgroups_strings[] =
 	[SETGROUPS_ALLOW] = "allow"
 };
 
+
+static void printUids(char *tip) 
+{
+	uid_t ruid, euid, suid;
+	getresuid(&ruid, &euid, &suid);
+	printf("[%s] ruid: %d, euid: %d, suid: %d\n", tip, ruid, euid, suid);
+}
+
+static void printGroups(char *tip) 
+{
+	gid_t groups[10];
+	int count = getgroups(10, groups);
+	printf("[%s] groups: ", tip);
+	for (int i = 0; i < count; i++) {
+		printf("%d, ", groups[i]);
+	}
+	printf("\n");
+}
+
+static void printCaps(char *tip) {
+	uint64_t cap;
+	uint64_t permitted, ambient;
+	struct __user_cap_header_struct header = {
+		.version = _LINUX_CAPABILITY_VERSION_3,
+		.pid = 0,
+	};
+
+	struct __user_cap_data_struct payload[_LINUX_CAPABILITY_U32S_3] = {{ 0 }};
+	if (capget(&header, payload) < 0)
+		err(EXIT_FAILURE, _("capget failed"));
+	permitted = ((uint64_t)payload[1].permitted << 32) | (uint64_t)payload[0].permitted;
+	
+	ambient = 0;
+	for (cap = 0; cap < (sizeof(permitted) * 8); cap++) {
+		if ((permitted & (1ULL << cap)) && prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, cap, 0, 0) == 1) {
+			ambient += (1ULL << cap);
+		}
+	}
+  
+  	printf("[%s] CapInh=0x%lx, CapPrm=0x%lx, CapEff=0x%lx, CapAmb=0x%lx\n", tip, 
+	  ((uint64_t)payload[1].inheritable << 32) | (uint64_t)payload[0].inheritable, permitted, 
+	  ((uint64_t)payload[1].effective << 32) | (uint64_t)payload[0].effective, (uint64_t)ambient);
+}
+
 static int setgroups_str2id(const char *str)
 {
 	size_t i;
@@ -707,6 +751,56 @@ static void __attribute__((__noreturn__)) usage(void)
 	exit(EXIT_SUCCESS);
 }
 
+/*
+1）为何普通用户也可以执行：./unshare --fork --user --pid --map-users=100000,10,100 /bin/bash，
+   即普通用户可以映射到父user namespace其他用户上？
+   答：--map-users的执行其实是由newuidmap来实现，这个工具设置了set UID位且owner是root。这意味着，普通
+   用户执行newuidmap时，可以获得root权限（具体执行流程很tricky，参考下面具体实现）。但是，这并不意味着普
+   通用户可以映射到父user namespace中的任意用户，因为newuidmap会检查/etc/subuid来判断当前ruid对应的
+   用户允许任意映射的UID范围。
+
+2）下面命令在keep capabilties的情况下，为何不能通过/bin/mount挂载proc文件系统？而换成--setuid 0后，
+   为啥又可以？
+   ./unshare --user --fork --pid --map-users=100000,0,100 -S 0 /bin/bash
+   答：/bin/mount 这命令会校验在-t选项下，当前ruid和euid是否同时为0，如果不满足，则会打印错误信息：mount: only root can use "--types" option。
+   
+   /bin/mount在init user namespace下具如下权限，虽然设置了set UID位且owner是root，但普通用户仅仅能
+   挂载/etc/fstab中定义的具有user选项的条目。
+   will@chuzhi-test:/tmp$ ls -l /bin/mount
+   -rwsr-xr-x 1 root root 55528 Jul 21  2020 /bin/mount
+
+  但在新的user namespace下，却是这样的（因为init user namespace下0号用户，映射后，在新的user namespace下不存在对应的用户）：
+  mail@chuzhi-test:~/projects/util-linux$ ls -l /bin/mount
+  -rwsr-xr-x 1 nobody nogroup 55528 Jul 21  2020 /bin/mount
+  
+  但通过下面的操作可以看到，在新的user namespace下，普通用户在具有CAP_SYS_ADMIN权限后，
+  是可以mount/umount的proc文件系统的（通过系统调用）。同时，在具有CAP_SETUID的能力下，
+  也是可以切换为root的（当然，仅仅是新user namespace下的root）。
+  will@chuzhi-test:~/projects/util-linux$ ./unshare --user --fork --pid --map-users=100000,0,10 --map-group=108 --setuid 8 --mount --keep-caps /bin/bash
+  [before unshare] ruid: 1000, euid: 1000, suid: 1000
+  [before unshare] groups: 27, 998, 1000, 
+  [before unshare] CapInh=0x0, CapPrm=0x0, CapEff=0x0
+  [after unshare] ruid: 65534, euid: 65534, suid: 65534
+  [after unshare] groups: 65534, 65534, 65534, 
+  [after unshare] CapInh=0x0, CapPrm=0x1ffffffffff, CapEff=0x1ffffffffff
+  [after mapgroup] groups: 65534, 65534, 108, 
+  [before setuid] ruid: 65534, euid: 65534, suid: 65534
+  [after setuid] ruid: 8, euid: 8, suid: 8
+  mail@chuzhi-test:~/projects/util-linux$ ls -l /bin/mount
+  -rwsr-xr-x 1 nobody nogroup 55528 Jul 21  2020 /bin/mount
+  mail@chuzhi-test:~/projects/util-linux$ /bin/mount -t proc none /tmp/proc/
+  mount: only root can use "--types" option
+  mail@chuzhi-test:~/projects/util-linux$ 
+  mail@chuzhi-test:~/projects/util-linux$ /tmp/worker 
+  [myapp] keepCaps: 0
+  [myapp] ruid=8, euid=8, suid=8
+  [myapp] CapInh=0x1ffffffffff, CapPrm=0x1ffffffffff, CapEff=0x1ffffffffff
+  [myapp] mount/umount successfully
+  continue: -
+  sucessfully became root
+  [myapp] ruid=0, euid=0, suid=0
+  [myapp] CapInh=0x1ffffffffff, CapPrm=0x1ffffffffff, CapEff=0x1fffffffff
+ **/
 int main(int argc, char *argv[])
 {
 	enum {
@@ -937,15 +1031,45 @@ int main(int argc, char *argv[])
 	/* clear any inherited settings */
 	signal(SIGCHLD, SIG_DFL);
 
+	// 如果CLONE_NEWNS指定了，unshare后本进程看到的是一个父进程mount namespace
+	// 下的一个副本，后续bind操作仅仅对副本有影响，因此将对父进程不可见。所以，这里需要
+	// 在unshare之前创建一个子进程（这个子进程看到的仍然是最初的mount namespace），
+	// 让子进程进行bind操作。
 	if (npersists && (unshare_flags & CLONE_NEWNS))
 		pid_bind = bind_ns_files_from_child(&fd_bind);
 
-	if (usermap || groupmap)
+	// 
+	// 如果这里的映射范围为1 且 映射到的UID是当前进程的effective uid，则在unshare后进
+	// 程映射也是可以的（下面map_id(_PATH_PROC_UIDMAP, mapuser, real_euid)便是这
+	// 中场景）。
+	//
+	// 但如果要映射的范围超过1 或者 映射到的UID 不是 当前进程的effective uid，则需要在
+	// 父user namesapce下具有CAP_SETUID能力。这里必须在unshare之前，通过子进程的形式
+	// 去操作（此时创建的子进程仍然是和父user namespace关联的）。因为，unshare后，当前
+	// 进程重新关联到了新的子user namespace，而父user namespace下的所有capabilities
+	// 将会失去（即使unshare之前的euid是root）。
+	//
+	// 对普通用户来说，他是不具有父user namespace下的CAP_SETUID，这意味着即使创建了子进程
+	// 还是没法直接修改/proc/self/uid_map和/proc/self/guid_map. 因此，这里并不是子进程
+	// 直接去修改这两个文件，而是通过调用newuidmap/newuidmap去间接操作他们。执行newuidmap
+	// 或newuidmap将会获得root权限（set UID设置了）。但这两个程序会根据/etc/subuid和/etc/subgid 
+	// 来判读用户是否可以设置相应的映射。因此，通过/etc/subuid和/etc/subgid，普通用户也可以
+	// 映射到父user namespace下的其他uid，而不仅仅是自己的euid。
+	if (usermap || groupmap) {
 		pid_idmap = map_ids_from_child(&fd_idmap, mapuser, usermap,
 					       mapgroup, groupmap);
+	}
+
+	printUids("before unshare");
+	printGroups("before unshare");
+	printCaps("before unshare");
 
 	if (-1 == unshare(unshare_flags))
 		err(EXIT_FAILURE, _("unshare failed"));
+	
+	printUids("after unshare");
+	printGroups("after unshare");
+	printCaps("after unshare");
 
 	/* Tell child we've called unshare() */
 	if (usermap || groupmap)
@@ -957,6 +1081,10 @@ int main(int argc, char *argv[])
 	if (force_monotonic)
 		settime(monotonic, CLOCK_MONOTONIC);
 
+	// 在具有CLONE_NEWPID选项的情况下，unshare后当前进程关联的PID namespace
+	// 并不不会改变。但是，它后续创建的子进程将会自动关联新的PID namespace （其中，
+	// 第一个创建的子进程将会承担init进程的角色，且其进程ID在新PID namespace下也
+	// 是1）。因此，如果想要在新的PID namespace下执行命令，则需要制定--fork选项。
 	if (forkit) {
 		if (sigemptyset(&sigset) != 0 ||
 			sigaddset(&sigset, SIGINT) != 0 ||
@@ -1051,19 +1179,24 @@ int main(int argc, char *argv[])
 #endif
 	}
 
-        if (mapuser != (uid_t) -1 && !usermap)
+	if (mapuser != (uid_t) -1 && !usermap) {
+		printUids("before map id");
 		map_id(_PATH_PROC_UIDMAP, mapuser, real_euid);
+		printUids("after map id");
+	}
 
-        /* Since Linux 3.19 unprivileged writing of /proc/self/gid_map
-         * has been disabled unless /proc/self/setgroups is written
-         * first to permanently disable the ability to call setgroups
-         * in that user namespace. */
+	/* Since Linux 3.19 unprivileged writing of /proc/self/gid_map
+	 * has been disabled unless /proc/self/setgroups is written
+	 * first to permanently disable the ability to call setgroups
+	 * in that user namespace. */
 	if (mapgroup != (gid_t) -1 && !groupmap) {
 		if (setgrpcmd == SETGROUPS_ALLOW)
 			errx(EXIT_FAILURE, _("options --setgroups=allow and "
 					"--map-group are mutually exclusive"));
 		setgroups_control(SETGROUPS_DENY);
 		map_id(_PATH_PROC_GIDMAP, mapgroup, real_egid);
+
+		printGroups("after mapgroup");
 	}
 
 	if (setgrpcmd != SETGROUPS_NONE)
@@ -1081,6 +1214,8 @@ int main(int argc, char *argv[])
 	if (newdir && chdir(newdir))
 		err(EXIT_FAILURE, _("cannot chdir to '%s'"), newdir);
 
+	// 对于普通用户而言，在CLONE_NEWUSER下，可以挂载proc文件系统，但需要同时设置选项
+	// CLONE_NEWPID （proc文件系统中有进程信息）。
 	if (procmnt) {
 		/* When not changing root and using the default propagation flags
 		   then the recursive propagation change of root will
@@ -1104,13 +1239,27 @@ int main(int argc, char *argv[])
 		if (setgid(gid) < 0)		/* change GID */
 			err(EXIT_FAILURE, _("setgid failed"));
 	}
-	if (force_uid && setuid(uid) < 0)	/* change UID */
-		err(EXIT_FAILURE, _("setuid failed"));
 
+	// 在--user的情况下，必须在uid_map建立后才可以进行，同时uid必须是uid_map中映射范围内的。
+	// 在--user的情况下，即使对普通用户而言，此时具有新user namesapce下全部capabilities，
+	// 因此，setuid可以成功的。但在execvp时，如果uid不为0，则会失去这些capabilities（除非
+	// 执行的文件定义capabilities）或者 设置了ambient capabilies。
+	if (force_uid) {
+		printUids("before setuid");
+		if (setuid(uid) < 0)	/* change UID */
+			err(EXIT_FAILURE, _("setuid failed"));
+		printUids("after setuid");
+	}
+
+	// 对于普通用户而言，在执行execvp系统调用后，它drop掉之前所有的capabilies，除非
+	// 执行的program文件本身设置了capabilies 或者 执行capabilies之前设置了ambient 
+	// capabilies。而对于root而言，总是在execvp系统调用后，自动获得全量的capabilies，
+	// 即使是在执行execvp之前没有全量的capabilies（比如手动drop了一些）。
 	/* We use capabilities system calls to propagate the permitted
 	 * capabilities into the ambient set because we have already
 	 * forked so are in async-signal-safe context. */
 	if (keepcaps && (unshare_flags & CLONE_NEWUSER)) {
+		printCaps("before set amb");
 		struct __user_cap_header_struct header = {
 			.version = _LINUX_CAPABILITY_VERSION_3,
 			.pid = 0,
@@ -1122,6 +1271,7 @@ int main(int argc, char *argv[])
 		if (capget(&header, payload) < 0)
 			err(EXIT_FAILURE, _("capget failed"));
 
+		// capabilies手册上说明，ambient capabilies总是permitted和inheritable的交集。
 		/* In order the make capabilities ambient, we first need to ensure
 		 * that they are all inheritable. */
 		payload[0].inheritable = payload[0].permitted;
@@ -1138,11 +1288,12 @@ int main(int argc, char *argv[])
 			if (cap > (uint64_t) cap_last_cap())
 				continue;
 
-			if ((effective & (1 << cap))
+			if ((effective & (1ULL << cap))
 			    && prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE, cap, 0, 0) < 0)
-					err(EXIT_FAILURE, _("prctl(PR_CAP_AMBIENT) failed"));
-                }
+				err(EXIT_FAILURE, _("prctl(PR_CAP_AMBIENT) failed"));
         }
+		printCaps("after set amb");
+    }
 
 	if (optind < argc) {
 		execvp(argv[optind], argv + optind);
